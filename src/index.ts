@@ -110,6 +110,10 @@ export const SelfCompact: Plugin = async ({ client }) => {
   let justCompacted = false             // set by session.compacted event
   let compactTriggered = false          // prevent double-triggering
 
+  // Last known message snapshot — used by system.transform when messages.transform
+  // fires after it (hook ordering is not guaranteed). Stored as total char count.
+  let lastMessageChars = 0
+
   // ─── Compute usable limit from model info ──────────────────────────────────
   // Mirrors OpenCode's isOverflow logic:
   //   usable = limit.context - max(reserved, maxOutputTokens)
@@ -149,6 +153,9 @@ export const SelfCompact: Plugin = async ({ client }) => {
     // ── 2. messages.transform — count tokens ────────────────────────────────
     // Runs before every LLM call. We walk the full message array and estimate
     // token count. No external tokenizer — heuristic is precise enough.
+    // NOTE: hook ordering vs system.transform is not guaranteed. We store
+    // the count in shared state and also in lastMessageChars so system.transform
+    // can recompute if it fires first.
     "experimental.chat.messages.transform": async (_input, output) => {
       if (!userConfig.enabled) return
 
@@ -164,6 +171,7 @@ export const SelfCompact: Plugin = async ({ client }) => {
         }
       }
 
+      lastMessageChars = totalChars
       currentTokens = estimateTokens(totalChars)
       currentPercent = usableLimit > 0
         ? Math.round((currentTokens / usableLimit) * 100)
@@ -182,10 +190,12 @@ export const SelfCompact: Plugin = async ({ client }) => {
     // ── 3. system.transform — inject awareness ──────────────────────────────
     // Runs before every LLM call. We:
     //   a) Capture sessionID and model info for later use
-    //   b) Skip internal agents (title generator, compaction summarizer)
-    //   c) Inject a usage line (always, if showUsage)
-    //   d) Inject a nudge if at or above threshold
-    //   e) Inject a post-compaction note (one-shot)
+    //   b) Recompute token count from lastMessageChars (handles case where
+    //      messages.transform fires after this hook due to ordering)
+    //   c) Skip internal agents (title generator, compaction summarizer)
+    //   d) Inject a usage line (always, if showUsage)
+    //   e) Inject a nudge if at or above threshold
+    //   f) Inject a post-compaction note (one-shot)
     "experimental.chat.system.transform": async (input, output) => {
       if (!userConfig.enabled) return
 
@@ -196,6 +206,16 @@ export const SelfCompact: Plugin = async ({ client }) => {
         providerID = input.model.providerID
         usableLimit = computeUsableLimit(input.model)
         contextLimit = input.model.limit.context
+      }
+
+      // Compute token estimate from last known message chars + current system text.
+      // If messages.transform hasn't fired yet (first call or fires after this hook),
+      // we still count the system prompt so the estimate is never zero.
+      const systemChars = output.system.join("").length
+      const totalChars = lastMessageChars + systemChars
+      if (totalChars > 0 && usableLimit > 0) {
+        currentTokens = estimateTokens(totalChars)
+        currentPercent = Math.round((currentTokens / usableLimit) * 100)
       }
 
       // Skip internal agents
@@ -259,32 +279,25 @@ export const SelfCompact: Plugin = async ({ client }) => {
           }
           compactTriggered = true
 
-          // Trigger compaction via SDK (with a short delay to let this tool
-          // response land in the conversation before compaction begins)
+          // Trigger compaction via SDK — fire and forget (don't await).
+          // The tool response is returned synchronously below; the summarize
+          // call happens asynchronously in the background.
           if (sessionID && modelID && providerID) {
-            const sid = sessionID
-            const mid = modelID
-            const pid = providerID
-
-            setTimeout(async () => {
+            void client.session.summarize({
+              path: { id: sessionID },
+              body: { providerID, modelID },
+            }).catch(async (e) => {
+              // Silent fail — auto-compaction will fire naturally anyway
               try {
-                await client.session.summarize({
-                  path: { id: sid },
-                  body: { providerID: pid, modelID: mid },
+                await client.app.log({
+                  body: {
+                    service: "self-compact",
+                    level: "warn",
+                    message: `Failed to trigger compaction: ${e}`,
+                  },
                 })
-              } catch (e) {
-                // Log but don't crash — auto-compaction will fire naturally anyway
-                try {
-                  await client.app.log({
-                    body: {
-                      service: "self-compact",
-                      level: "warn",
-                      message: `Failed to trigger compaction: ${e}`,
-                    },
-                  })
-                } catch {}
-              }
-            }, 800)
+              } catch {}
+            })
           }
 
           return (
