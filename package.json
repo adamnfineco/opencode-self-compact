@@ -1,0 +1,31 @@
+{
+  "name": "opencode-self-compact",
+  "version": "0.1.0",
+  "description": "OpenCode plugin that gives agents context window awareness and enriches compaction with agent-provided state dumps",
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsc --watch"
+  },
+  "keywords": [
+    "opencode",
+    "opencode-plugin",
+    "context",
+    "compaction"
+  ],
+  "license": "MIT",
+  "peerDependencies": {
+    "@opencode-ai/plugin": ">=1.2.0"
+  },
+  "devDependencies": {
+    "@opencode-ai/plugin": "1.2.20",
+    "@opencode-ai/sdk": "1.2.20",
+    "@types/node": "^25.3.5",
+    "typescript": "^5.0.0"
+  }
+}
