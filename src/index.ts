@@ -7,27 +7,23 @@
  * How it works:
  * 1. Every LLM call: count tokens in the message array, inject a small
  *    usage line into the system prompt so the agent always knows where it stands.
- * 2. At threshold (default 85% of usable limit): escalate the system prompt
- *    to tell the agent to finish its current step and call compact_checkpoint.
- * 3. compact_checkpoint tool: agent provides structured state (goal, progress,
+ * 2. When tokens reach (usableLimit - buffer): inject a directive telling the
+ *    agent to call compact_checkpoint as its only action this turn.
+ * 3. If the agent ignores the directive and is still over threshold on the
+ *    next turn: abort the current generation, send a synthetic checkpoint
+ *    prompt, giving the agent one forced turn to save state.
+ * 4. compact_checkpoint tool: agent provides structured state (goal, progress,
  *    next steps, decisions). Plugin stores it and triggers compaction.
- * 4. experimental.session.compacting hook: injects the agent's state dump into
+ * 5. experimental.session.compacting hook: injects the agent's state dump into
  *    the compaction prompt so the summary preserves what actually matters.
- * 5. session.compacted event: plugin resets and injects a one-shot "you just
+ * 6. session.compacted event: plugin resets and injects a one-shot "you just
  *    resumed from compaction" note so the agent can orient itself.
- *
- * The checkpoint is best-effort — if the agent ignores the nudge, compaction
- * still fires naturally (no worse than default behavior).
- *
- * Install:
- *   Add "opencode-self-compact" to the "plugin" array in opencode.json
  *
  * Config (optional, ~/.config/opencode/self-compact.json):
  *   {
- *     "threshold": 75,          // % of usable limit to trigger the soft nudge (default: 75)
- *     "hardStopBuffer": 2000,   // tokens before overflow to hard-stop (default: 2000)
- *     "showUsage": true,        // always show usage line in system prompt (default: true)
- *     "enabled": true           // disable entirely (default: true)
+ *     "buffer": 8000,       // tokens before overflow to trigger checkpoint (default: 8000)
+ *     "showUsage": true,    // always show usage line in system prompt (default: true)
+ *     "enabled": true       // disable entirely (default: true)
  *   }
  */
 
@@ -41,16 +37,17 @@ import type { Event, Model } from "@opencode-ai/sdk"
 // ─── Types ────────────────────────────────────────────────────────────────────
 
 interface SelfCompactConfig {
-  /** % of usable limit at which to nudge the agent (default: 75) */
-  threshold: number
   /**
-   * Token buffer before overflow at which to issue a hard-stop directive (default: 2000).
-   * The hard-stop fires when estimated tokens reach (usableLimit - hardStopBuffer).
-   * Same unit as OpenCode's compaction.reserved — tokens, not percentage.
-   * Default of 2000 gives the agent roughly one medium response of headroom.
-   * Increase if your sessions produce large outputs per turn.
+   * Token buffer before overflow at which to trigger the checkpoint (default: 8000).
+   * When estimated tokens reach (usableLimit - buffer), the plugin tells the agent
+   * to call compact_checkpoint. Same unit as OpenCode's compaction.reserved.
+   *
+   * This needs to be large enough for:
+   *   - The model's checkpoint response (~1-2k tokens)
+   *   - A safety margin for heuristic token counting error (~2-3k)
+   *   - Room for the current turn's output to land (~2-3k)
    */
-  hardStopBuffer: number
+  buffer: number
   /** Always show the usage line in the system prompt (default: true) */
   showUsage: boolean
   /** Disable the plugin entirely (default: true = enabled) */
@@ -79,8 +76,7 @@ const INTERNAL_AGENT_SIGNATURES = [
 // ─── Config loading ───────────────────────────────────────────────────────────
 
 const DEFAULT_CONFIG: SelfCompactConfig = {
-  threshold: 75,
-  hardStopBuffer: 2000,
+  buffer: 8000,
   showUsage: true,
   enabled: true,
 }
@@ -119,6 +115,8 @@ export const SelfCompact: Plugin = async ({ client }) => {
   let providerID: string | null = null  // for session.summarize()
   let justCompacted = false             // set by session.compacted event
   let compactTriggered = false          // prevent double-triggering
+  let directiveInjected = false         // true after we inject the checkpoint directive
+  let abortFired = false                // prevent double-firing the abort→prompt orchestration
 
   // Last known message snapshot — used by system.transform when messages.transform
   // fires after it (hook ordering is not guaranteed). Stored as total char count.
@@ -145,6 +143,56 @@ export const SelfCompact: Plugin = async ({ client }) => {
       : model.limit.context - maxOutputTokens
   }
 
+  // ─── Abort → Prompt orchestration ──────────────────────────────────────────
+  // If the agent ignored our directive and is still over threshold:
+  //   1. Abort the current model generation
+  //   2. Send a synthetic prompt giving the model one forced turn to checkpoint
+  //   3. Model calls compact_checkpoint, which triggers compaction
+  //
+  // Fire-and-forget — if it fails, OpenCode auto-compaction catches it anyway.
+
+  function fireAbortAndPrompt() {
+    if (abortFired || !sessionID) return
+    abortFired = true
+    compactTriggered = true
+
+    const remaining = usableLimit - currentTokens
+
+    void (async () => {
+      try {
+        // 1. Abort current generation
+        await client.session.abort({ path: { id: sessionID! } })
+
+        // 2. Send checkpoint prompt — model gets one turn to save state
+        await (client.session as any).prompt_async({
+          path: { id: sessionID! },
+          body: {
+            parts: [{
+              type: "text",
+              text:
+                `[SYSTEM: Context window emergency — ${remaining.toLocaleString()} tokens remaining before overflow. ` +
+                `Your previous response was interrupted to prevent context loss. ` +
+                `Call compact_checkpoint immediately with your current state: ` +
+                `goal, accomplished, in_progress, next_steps, key_decisions, relevant_files. ` +
+                `Do NOT do any other work — just save your state.]`,
+            }],
+          },
+        })
+      } catch (e) {
+        // If abort/prompt fails, OpenCode auto-compaction is the backstop
+        try {
+          await client.app.log({
+            body: {
+              service: "self-compact",
+              level: "warn",
+              message: `Abort+prompt orchestration failed: ${e}`,
+            },
+          })
+        } catch {}
+      }
+    })().catch(() => {})
+  }
+
   // ─── Hooks ────────────────────────────────────────────────────────────────
 
   return {
@@ -152,7 +200,7 @@ export const SelfCompact: Plugin = async ({ client }) => {
     config: async (opencodeConfig) => {
       if (!userConfig.enabled) return
 
-      // Read OpenCode's reserved buffer so our thresholds track theirs
+      // Read OpenCode's reserved buffer so our threshold tracks theirs
       compactionReserved = (opencodeConfig as any).compaction?.reserved ?? 20_000
 
       // Auto-allow compact_checkpoint — no permission prompt needed
@@ -201,20 +249,22 @@ export const SelfCompact: Plugin = async ({ client }) => {
       // without us catching the event — e.g., overflow path)
       if (compactTriggered && currentPercent < 50) {
         compactTriggered = false
+        directiveInjected = false
+        abortFired = false
         justCompacted = true
         pendingCheckpoint = null
       }
     },
 
-    // ── 3. system.transform — inject awareness ──────────────────────────────
-    // Runs before every LLM call. We:
-    //   a) Capture sessionID and model info for later use
-    //   b) Recompute token count from lastMessageChars (handles case where
-    //      messages.transform fires after this hook due to ordering)
-    //   c) Skip internal agents (title generator, compaction summarizer)
-    //   d) Inject a usage line (always, if showUsage)
-    //   e) Inject a nudge if at or above threshold
-    //   f) Inject a post-compaction note (one-shot)
+    // ── 3. system.transform — inject awareness + trigger orchestration ──────
+    // Runs before every LLM call, before the model starts generating.
+    //
+    // Flow:
+    //   - Always inject usage line (awareness)
+    //   - If tokens >= (usableLimit - buffer) and we haven't acted yet:
+    //     inject checkpoint directive into system prompt
+    //   - If we already injected the directive last turn and the model ignored
+    //     it (still over threshold): fire abort→prompt orchestration
     "experimental.chat.system.transform": async (input, output) => {
       if (!userConfig.enabled) return
 
@@ -245,6 +295,8 @@ export const SelfCompact: Plugin = async ({ client }) => {
       if (justCompacted) {
         justCompacted = false
         compactTriggered = false
+        directiveInjected = false
+        abortFired = false
         output.system.push(
           `<context-note>Session was just compacted. You're continuing from a summary — review it above to orient yourself before proceeding.</context-note>`
         )
@@ -258,32 +310,26 @@ export const SelfCompact: Plugin = async ({ client }) => {
         )
       }
 
-      // Threshold nudge — two levels:
-      //   soft = percentage-based (default 75%)
-      //   hard = token-based buffer before overflow (default 2000 tokens from the wall)
-      const hardStopAt = usableLimit - (userConfig.hardStopBuffer ?? 2000)
-      const isHardStop = currentTokens >= hardStopAt
-      const isSoftNudge = currentPercent >= userConfig.threshold
+      // Check if we've crossed the threshold
+      const thresholdTokens = usableLimit - userConfig.buffer
+      const overThreshold = currentTokens >= thresholdTokens && !compactTriggered
 
-      if (!compactTriggered && (isHardStop || isSoftNudge)) {
-        if (isHardStop) {
-          const remaining = usableLimit - currentTokens
-          // Hard stop — agent is dangerously close to overflow. Be unambiguous.
-          output.system.push(
-            `<context-awareness level="critical">` +
-            `CRITICAL: Context is ${remaining.toLocaleString()} tokens from overflow (${currentTokens.toLocaleString()} / ${usableLimit.toLocaleString()} usable). ` +
-            `You MUST call compact_checkpoint RIGHT NOW as your very next action — do NOT finish any current step first, do NOT make any other tool calls. ` +
-            `If you do not call it immediately, compaction will fire without your state and you will lose context. ` +
-            `Include: goal, accomplished, in_progress, next_steps, key_decisions, relevant_files.` +
-            `</context-awareness>`
-          )
+      if (overThreshold) {
+        const remaining = usableLimit - currentTokens
+
+        if (directiveInjected) {
+          // We already told the model to checkpoint last turn and it ignored us.
+          // Escalate: abort and force a checkpoint turn.
+          fireAbortAndPrompt()
         } else {
-          // Soft nudge — agent has some runway, but should wrap up and checkpoint
+          // First time crossing threshold. Inject directive — model hasn't
+          // started generating yet, so this is the cleanest intervention.
+          directiveInjected = true
           output.system.push(
-            `<context-awareness level="warning">` +
-            `Context is at ${currentPercent}% capacity (${currentTokens.toLocaleString()} / ${usableLimit.toLocaleString()} usable tokens). ` +
-            `Call compact_checkpoint as your next action after completing the current response. ` +
-            `Do not start new tasks or tool calls — save your state now. ` +
+            `<context-awareness>` +
+            `Context is at ${currentPercent}% capacity (${currentTokens.toLocaleString()} / ${usableLimit.toLocaleString()} usable tokens, ` +
+            `${remaining.toLocaleString()} tokens remaining). ` +
+            `Finish your current atomic step, then call compact_checkpoint to save your state before compaction. ` +
             `Include: what the user is trying to accomplish, what's done, what's in progress, what's next, and any key decisions made.` +
             `</context-awareness>`
           )
@@ -383,6 +429,8 @@ export const SelfCompact: Plugin = async ({ client }) => {
         justCompacted = true
         pendingCheckpoint = null  // clear any stale checkpoint
         compactTriggered = false
+        directiveInjected = false
+        abortFired = false
       }
     },
   }
