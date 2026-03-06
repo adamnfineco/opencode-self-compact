@@ -1,20 +1,20 @@
-# opencode-self-compact
+# @adamnfineco/opencode-self-compact
 
-An OpenCode plugin that gives agents context window awareness and enriches compaction with agent-provided state — so they pick up where they left off.
+An [OpenCode](https://opencode.ai) plugin that gives agents context window awareness and enriches compaction with agent-provided state — so they pick up where they left off.
 
 ## The problem
 
-OpenCode auto-compacts when your context hits ~90% of the model's limit. By then the agent has no warning, the summary is generic, and whatever wasn't explicitly saved is gone. If the agent was mid-task, it loses track.
+OpenCode auto-compacts when context gets full. By then the agent has no warning, the summary is generic, and whatever wasn't explicitly saved is gone. If it was mid-task, it loses track.
 
 ## What this does
 
-1. **Injects a usage line into every system prompt** so the agent always knows where it stands (`<context-usage percent="45" .../>`)
-2. **At threshold (default 85% of usable limit)**, adds a directive telling the agent to finish its current step and call `compact_checkpoint`
-3. **`compact_checkpoint` tool** — the agent provides structured state (goal, what's done, what's in progress, next steps, key decisions, relevant files). The plugin stores it and triggers compaction.
-4. **Enriches the compaction summary** by injecting the agent's state dump into the compaction prompt — the summary preserves exactly what the agent chose to save
-5. **Detects post-compaction** via `session.compacted` event and injects a one-shot "you just resumed from compaction" note
+- **Always visible**: injects a live usage line into every system prompt so the agent knows where it stands
+- **At threshold** (default 85% of usable context): tells the agent to finish its current step and call `compact_checkpoint`
+- **`compact_checkpoint` tool**: the agent saves structured state — goal, what's done, what's in progress, next steps, key decisions, relevant files
+- **Enriched compaction**: the agent's state dump is injected into the compaction prompt so the summary preserves exactly what matters
+- **Post-compaction awareness**: one-shot note after resuming so the agent can orient itself
 
-The checkpoint is best-effort. If the agent ignores the nudge, compaction fires naturally — no worse than default behavior. When it does checkpoint, the summary is dramatically better.
+The checkpoint is best-effort. If the agent ignores the nudge, compaction fires naturally — no worse than default. When it does checkpoint, the summary is dramatically better.
 
 ## Install
 
@@ -22,13 +22,15 @@ Add to your `opencode.json`:
 
 ```json
 {
-  "plugin": ["opencode-self-compact"]
+  "plugin": ["github:adamnfineco/opencode-self-compact"]
 }
 ```
 
-## Config (optional)
+Requires OpenCode 1.2.0+.
 
-Create `~/.config/opencode/self-compact.json`:
+## Config
+
+Create `~/.config/opencode/self-compact.json` (all fields optional):
 
 ```json
 {
@@ -40,31 +42,46 @@ Create `~/.config/opencode/self-compact.json`:
 
 | Option | Default | Description |
 |--------|---------|-------------|
-| `threshold` | `85` | % of usable limit to trigger the nudge |
-| `showUsage` | `true` | Always show the usage line in system prompt |
-| `enabled` | `true` | Disable the plugin entirely |
+| `threshold` | `85` | % of usable context at which to nudge the agent |
+| `showUsage` | `true` | Always show the usage line in every system prompt |
+| `enabled` | `true` | Set to `false` to disable entirely |
 
-The threshold is computed against the **usable** context limit — `model.limit.context - max(compaction.reserved, maxOutputTokens)` — mirroring OpenCode's own compaction math. If you change `compaction.reserved` in your OpenCode config, this plugin's thresholds adjust automatically.
+The threshold is computed against the **usable** context limit — `model.limit.context - max(compaction.reserved, maxOutputTokens)` — mirroring OpenCode's own compaction math. If you tune `compaction.reserved` in your OpenCode config, this plugin's threshold adjusts automatically.
 
-## How it fits together
+## How it works
 
 ```
-Agent works → sees "Context: 45%" in system prompt → keeps working
-            → crosses 85% of usable limit
-            → "Finish your step, call compact_checkpoint"
-            → Agent calls compact_checkpoint with structured state
-            → Plugin stores state + triggers session.summarize()
-            → experimental.session.compacting fires
-            → Agent's state injected into compaction prompt
-            → Compact summary preserves what agent chose to save
-            → session.compacted event fires, plugin resets
-            → Next turn: "Session was just compacted" note
-            → Agent picks up where it left off ✨
+Agent works → sees usage in system prompt → keeps working
+           → crosses threshold (default 85%)
+           → "Finish your step, call compact_checkpoint"
+           → Agent calls compact_checkpoint with structured state
+           → State injected into compaction summary
+           → Agent picks up where it left off ✨
 ```
+
+The `compact_checkpoint` tool accepts:
+
+| Arg | Required | Description |
+|-----|----------|-------------|
+| `goal` | ✓ | What the user is trying to accomplish |
+| `accomplished` | ✓ | What's been completed this session |
+| `in_progress` | ✓ | What was actively being worked on |
+| `next_steps` | ✓ | What needs to happen next, in order |
+| `key_decisions` | — | Important decisions or discoveries |
+| `relevant_files` | — | Files modified or important to the task |
 
 ## Notes
 
-- Works with any agent, not just Solin
-- Skips internal OpenCode sub-agents (title generator, compaction summarizer)
-- No external tokenizer dependency — uses 4 chars ≈ 1 token heuristic
-- No persistence needed — state is per-session
+- Works with any agent
+- Skips OpenCode's internal sub-agents (title generator, compaction summarizer)
+- No external tokenizer — uses a char-count heuristic (4 chars ≈ 1 token), precise enough for threshold decisions
+- No persistence — state is per-session, no side effects
+
+## Development
+
+```sh
+git clone https://github.com/adamnfineco/opencode-self-compact
+cd opencode-self-compact
+bun install
+bun run build
+```

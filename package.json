@@ -1,24 +1,39 @@
 {
+  "$schema": "https://json.schemastore.org/package.json",
   "name": "opencode-self-compact",
   "version": "0.1.0",
-  "description": "OpenCode plugin that gives agents context window awareness and enriches compaction with agent-provided state dumps",
+  "description": "OpenCode plugin that gives agents context window awareness and enriches compaction with agent-provided state — so they pick up where they left off",
+  "author": "adamnfineco",
+  "license": "MIT",
   "type": "module",
-  "main": "dist/index.js",
-  "types": "dist/index.d.ts",
-  "files": [
-    "dist"
-  ],
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/adamnfineco/opencode-self-compact.git"
+  },
+  "bugs": {
+    "url": "https://github.com/adamnfineco/opencode-self-compact/issues"
+  },
+  "homepage": "https://github.com/adamnfineco/opencode-self-compact#readme",
   "scripts": {
     "build": "tsc",
-    "dev": "tsc --watch"
+    "dev": "tsc --watch",
+    "typecheck": "tsc --noEmit"
   },
   "keywords": [
     "opencode",
     "opencode-plugin",
+    "plugin",
     "context",
-    "compaction"
+    "compaction",
+    "context-window"
   ],
-  "license": "MIT",
+  "files": [
+    "dist/",
+    "README.md",
+    "LICENSE"
+  ],
   "peerDependencies": {
     "@opencode-ai/plugin": ">=1.2.0"
   },
