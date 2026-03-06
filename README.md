@@ -77,6 +77,44 @@ The `compact_checkpoint` tool accepts:
 - No external tokenizer — uses a char-count heuristic (4 chars ≈ 1 token), precise enough for threshold decisions
 - No persistence — state is per-session, no side effects
 
+## For LLM Agents
+
+<details>
+<summary>Instructions for AI assistants helping set this up</summary>
+
+### Installing
+
+Add to the user's `opencode.json` (global: `~/.config/opencode/opencode.json`, or project: `.opencode/opencode.json`):
+
+```json
+{
+  "plugin": ["github:adamnfineco/opencode-self-compact"]
+}
+```
+
+### How to use compact_checkpoint
+
+Once installed, you'll see a `<context-usage>` tag in every system prompt showing current token usage. When context approaches the threshold, a `<context-awareness>` directive will appear. At that point, finish your current atomic step and call `compact_checkpoint`:
+
+```
+compact_checkpoint(
+  goal: "What the user is trying to accomplish overall",
+  accomplished: "What's been completed this session",
+  in_progress: "The specific thing being worked on right now",
+  next_steps: "Ordered list of what comes next",
+  key_decisions: "Important decisions or discoveries made",  // optional
+  relevant_files: "Files modified or important to the task"  // optional
+)
+```
+
+Be specific — the content of this call becomes the compaction summary. Vague inputs produce vague handoffs.
+
+### Verifying it's working
+
+Ask the agent: *"What is your current context window usage?"* — it should report a percentage and token count from the `<context-usage>` tag in its system prompt.
+
+</details>
+
 ## Development
 
 ```sh
