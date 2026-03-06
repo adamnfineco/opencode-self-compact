@@ -1,4 +1,4 @@
-# @adamnfineco/opencode-self-compact
+# opencode-self-compact
 
 An [OpenCode](https://opencode.ai) plugin that gives agents context window awareness and enriches compaction with agent-provided state — so they pick up where they left off.
 
@@ -8,13 +8,13 @@ OpenCode auto-compacts when context gets full. By then the agent has no warning,
 
 ## What this does
 
-- **Always visible**: injects a live usage line into every system prompt so the agent knows where it stands
-- **At threshold** (default 85% of usable context): tells the agent to finish its current step and call `compact_checkpoint`
+- **Always visible**: injects a live `<context-usage>` tag into every system prompt so the agent knows where it stands
+- **At threshold**: when tokens approach the usable limit, injects a directive telling the agent to call `compact_checkpoint`
+- **Escalation**: if the agent ignores the directive, the plugin aborts the current generation and sends a forced checkpoint prompt — giving the agent one last turn to save state
 - **`compact_checkpoint` tool**: the agent saves structured state — goal, what's done, what's in progress, next steps, key decisions, relevant files
 - **Enriched compaction**: the agent's state dump is injected into the compaction prompt so the summary preserves exactly what matters
 - **Post-compaction awareness**: one-shot note after resuming so the agent can orient itself
-
-The checkpoint is best-effort. If the agent ignores the nudge, compaction fires naturally — no worse than default. When it does checkpoint, the summary is dramatically better.
+- **Backstop**: if all else fails, OpenCode's auto-compaction still catches it — no worse than default
 
 ## Install
 
@@ -34,7 +34,7 @@ Create `~/.config/opencode/self-compact.json` (all fields optional):
 
 ```json
 {
-  "threshold": 85,
+  "usableLimitBuffer": 4000,
   "showUsage": true,
   "enabled": true
 }
@@ -42,40 +42,53 @@ Create `~/.config/opencode/self-compact.json` (all fields optional):
 
 | Option | Default | Description |
 |--------|---------|-------------|
-| `threshold` | `85` | % of usable context at which to nudge the agent |
+| `usableLimitBuffer` | `4000` | Tokens before the usable limit at which to trigger the checkpoint. The plugin fires when estimated tokens reach `usableLimit - usableLimitBuffer`. Same unit as OpenCode's `compaction.reserved`. |
 | `showUsage` | `true` | Always show the usage line in every system prompt |
 | `enabled` | `true` | Set to `false` to disable entirely |
 
-The threshold is computed against the **usable** context limit — `model.limit.context - max(compaction.reserved, maxOutputTokens)` — mirroring OpenCode's own compaction math. If you tune `compaction.reserved` in your OpenCode config, this plugin's threshold adjusts automatically.
+The usable limit is derived from your [OpenCode compaction config](https://opencode.ai/docs/config/#compaction) (currently defaults to `reserved: 20000`). This plugin reads that automatically — no need to configure anything here unless you want to tune the checkpoint buffer itself.
+
+The default of 4000 covers the checkpoint response (~500-1k tokens), heuristic counting margin (~1-2k), and headroom for the current turn (~1-2k). Increase it if compaction fires before the checkpoint lands; decrease it to squeeze more usable context (below 2000 is risky).
 
 ## How it works
 
 ```
-Agent works → sees usage in system prompt → keeps working
-           → crosses threshold (default 85%)
-           → "Finish your step, call compact_checkpoint"
-           → Agent calls compact_checkpoint with structured state
-           → State injected into compaction summary
-           → Agent picks up where it left off ✨
+Agent works normally
+  └─ sees <context-usage> tag in every system prompt (awareness)
+
+Tokens approach the limit (usableLimit - usableLimitBuffer)
+  └─ Directive injected: "call compact_checkpoint, nothing else"
+  └─ Model calls compact_checkpoint with structured state
+  └─ Plugin triggers compaction with that state enriching the summary
+  └─ Agent resumes from a clean, structured summary
+
+If the model ignores the directive:
+  └─ Next turn: plugin aborts generation
+  └─ Sends forced checkpoint prompt
+  └─ Model gets one last turn to save state
+
+If everything fails:
+  └─ OpenCode auto-compaction catches it (default behavior, no enrichment)
 ```
 
-The `compact_checkpoint` tool accepts:
+## The `compact_checkpoint` tool
 
 | Arg | Required | Description |
 |-----|----------|-------------|
-| `goal` | ✓ | What the user is trying to accomplish |
-| `accomplished` | ✓ | What's been completed this session |
-| `in_progress` | ✓ | What was actively being worked on |
-| `next_steps` | ✓ | What needs to happen next, in order |
+| `goal` | yes | What the user is trying to accomplish |
+| `accomplished` | yes | What's been completed this session |
+| `in_progress` | yes | What was actively being worked on |
+| `next_steps` | yes | What needs to happen next, in order |
 | `key_decisions` | — | Important decisions or discoveries |
 | `relevant_files` | — | Files modified or important to the task |
 
 ## Notes
 
-- Works with any agent
+- Works with any model and any agent
 - Skips OpenCode's internal sub-agents (title generator, compaction summarizer)
 - No external tokenizer — uses a char-count heuristic (4 chars ≈ 1 token), precise enough for threshold decisions
 - No persistence — state is per-session, no side effects
+- Threshold is token-based (same unit as OpenCode's `compaction.reserved`), not percentage-based
 
 ## For LLM Agents
 
@@ -92,9 +105,11 @@ Add to the user's `opencode.json` (global: `~/.config/opencode/opencode.json`, o
 }
 ```
 
-### How to use compact_checkpoint
+### How it works for you
 
-Once installed, you'll see a `<context-usage>` tag in every system prompt showing current token usage. When context approaches the threshold, a `<context-awareness>` directive will appear. At that point, finish your current atomic step and call `compact_checkpoint`:
+Once installed, you'll see a `<context-usage>` tag in every system prompt showing your current token usage. When context approaches the limit, a `<context-awareness>` directive will appear telling you to call `compact_checkpoint`.
+
+When you see the directive, respond ONLY with the `compact_checkpoint` call — no other text or tool calls:
 
 ```
 compact_checkpoint(
@@ -108,6 +123,8 @@ compact_checkpoint(
 ```
 
 Be specific — the content of this call becomes the compaction summary. Vague inputs produce vague handoffs.
+
+If you ignore the directive, your generation will be aborted and you'll get one forced turn to checkpoint. Don't ignore it.
 
 ### Verifying it's working
 

@@ -21,7 +21,7 @@
  *
  * Config (optional, ~/.config/opencode/self-compact.json):
  *   {
- *     "usableLimitBuffer": 8000,  // tokens before the usable limit to trigger checkpoint (default: 8000)
+ *     "usableLimitBuffer": 4000,  // tokens before the usable limit to trigger checkpoint (default: 4000)
  *     "showUsage": true,          // always show usage line in system prompt (default: true)
  *     "enabled": true             // disable entirely (default: true)
  *   }
@@ -38,14 +38,17 @@ import type { Event, Model } from "@opencode-ai/sdk"
 
 interface SelfCompactConfig {
   /**
-   * Token buffer before the usable limit at which to trigger the checkpoint (default: 8000).
+   * Token buffer before the usable limit at which to trigger the checkpoint (default: 4000).
    * When estimated tokens reach (usableLimit - usableLimitBuffer), the plugin tells
    * the agent to call compact_checkpoint. Same unit as OpenCode's compaction.reserved.
    *
-   * This needs to be large enough for:
-   *   - The model's checkpoint response (~1-2k tokens)
-   *   - A safety margin for heuristic token counting error (~2-3k)
-   *   - Room for the current turn's output to land (~2-3k)
+   * The default of 4000 covers:
+   *   - The checkpoint response itself (~500-1000 tokens — just a tool call)
+   *   - Heuristic token counting margin (~1-2k)
+   *   - Headroom for the current turn's tail end (~1-2k)
+   *
+   * The directive constrains the model to output ONLY the checkpoint call,
+   * keeping the response lean.
    */
   usableLimitBuffer: number
   /** Always show the usage line in the system prompt (default: true) */
@@ -76,7 +79,7 @@ const INTERNAL_AGENT_SIGNATURES = [
 // ─── Config loading ───────────────────────────────────────────────────────────
 
 const DEFAULT_CONFIG: SelfCompactConfig = {
-  usableLimitBuffer: 8000,
+  usableLimitBuffer: 4000,
   showUsage: true,
   enabled: true,
 }
@@ -172,9 +175,8 @@ export const SelfCompact: Plugin = async ({ client }) => {
               text:
                 `[SYSTEM: Context window emergency — ${remaining.toLocaleString()} tokens remaining before overflow. ` +
                 `Your previous response was interrupted to prevent context loss. ` +
-                `Call compact_checkpoint immediately with your current state: ` +
-                `goal, accomplished, in_progress, next_steps, key_decisions, relevant_files. ` +
-                `Do NOT do any other work — just save your state.]`,
+                `Respond ONLY with a compact_checkpoint call — no other text, no other tool calls. ` +
+                `Include: goal, accomplished, in_progress, next_steps, key_decisions, relevant_files.]`,
             }],
           },
         })
@@ -326,12 +328,11 @@ export const SelfCompact: Plugin = async ({ client }) => {
           // started generating yet, so this is the cleanest intervention.
           directiveInjected = true
           output.system.push(
-            `<context-awareness>` +
-            `Context is at ${currentPercent}% capacity (${currentTokens.toLocaleString()} / ${usableLimit.toLocaleString()} usable tokens, ` +
+            `<context-awareness>Context is at ${currentPercent}% capacity (${currentTokens.toLocaleString()} / ${usableLimit.toLocaleString()} usable tokens, ` +
             `${remaining.toLocaleString()} tokens remaining). ` +
             `Finish your current atomic step, then call compact_checkpoint to save your state before compaction. ` +
-            `Include: what the user is trying to accomplish, what's done, what's in progress, what's next, and any key decisions made.` +
-            `</context-awareness>`
+            `Include: what the user is trying to accomplish, what's done, what's in progress, what's next, and any key decisions made. ` +
+            `Keep your response minimal — output ONLY the compact_checkpoint call and a brief message to the user. Do not start new work.</context-awareness>`
           )
         }
       }
