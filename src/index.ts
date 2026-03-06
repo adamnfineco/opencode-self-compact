@@ -24,9 +24,10 @@
  *
  * Config (optional, ~/.config/opencode/self-compact.json):
  *   {
- *     "threshold": 85,      // % of usable limit to trigger the nudge (default: 85)
- *     "showUsage": true,    // always show usage line in system prompt (default: true)
- *     "enabled": true       // disable entirely (default: true)
+ *     "threshold": 75,          // % of usable limit to trigger the soft nudge (default: 75)
+ *     "hardStopThreshold": 88,  // % at which to issue a hard-stop directive (default: 88)
+ *     "showUsage": true,        // always show usage line in system prompt (default: true)
+ *     "enabled": true           // disable entirely (default: true)
  *   }
  */
 
@@ -40,8 +41,10 @@ import type { Event, Model } from "@opencode-ai/sdk"
 // ─── Types ────────────────────────────────────────────────────────────────────
 
 interface SelfCompactConfig {
-  /** % of usable limit at which to nudge the agent (default: 85) */
+  /** % of usable limit at which to nudge the agent (default: 75) */
   threshold: number
+  /** % at which to issue a hard-stop directive — call compact_checkpoint NOW (default: 88) */
+  hardStopThreshold: number
   /** Always show the usage line in the system prompt (default: true) */
   showUsage: boolean
   /** Disable the plugin entirely (default: true = enabled) */
@@ -70,7 +73,8 @@ const INTERNAL_AGENT_SIGNATURES = [
 // ─── Config loading ───────────────────────────────────────────────────────────
 
 const DEFAULT_CONFIG: SelfCompactConfig = {
-  threshold: 85,
+  threshold: 75,
+  hardStopThreshold: 88,
   showUsage: true,
   enabled: true,
 }
@@ -239,15 +243,31 @@ export const SelfCompact: Plugin = async ({ client }) => {
         )
       }
 
-      // Threshold nudge
-      if (currentPercent >= userConfig.threshold && !compactTriggered) {
-        output.system.push(
-          `<context-awareness>` +
-          `Context is at ${currentPercent}% capacity (${currentTokens.toLocaleString()} / ${usableLimit.toLocaleString()} usable tokens). ` +
-          `Finish your current atomic step, then call compact_checkpoint to save your state before compaction. ` +
-          `Include: what the user is trying to accomplish, what's done, what's in progress, what's next, and any key decisions made.` +
-          `</context-awareness>`
-        )
+      // Threshold nudge — two levels
+      if (!compactTriggered && currentPercent >= userConfig.threshold) {
+        const hardStop = currentPercent >= (userConfig.hardStopThreshold ?? 88)
+
+        if (hardStop) {
+          // Hard stop — agent is dangerously close to overflow. Be unambiguous.
+          output.system.push(
+            `<context-awareness level="critical">` +
+            `CRITICAL: Context is at ${currentPercent}% (${currentTokens.toLocaleString()} / ${usableLimit.toLocaleString()} usable tokens). ` +
+            `You MUST call compact_checkpoint RIGHT NOW as your very next action — do NOT finish any current step first, do NOT make any other tool calls. ` +
+            `If you do not call it immediately, compaction will fire without your state and you will lose context. ` +
+            `Include: goal, accomplished, in_progress, next_steps, key_decisions, relevant_files.` +
+            `</context-awareness>`
+          )
+        } else {
+          // Soft nudge — agent has some runway, but should wrap up and checkpoint
+          output.system.push(
+            `<context-awareness level="warning">` +
+            `Context is at ${currentPercent}% capacity (${currentTokens.toLocaleString()} / ${usableLimit.toLocaleString()} usable tokens). ` +
+            `Call compact_checkpoint as your next action after completing the current response. ` +
+            `Do not start new tasks or tool calls — save your state now. ` +
+            `Include: what the user is trying to accomplish, what's done, what's in progress, what's next, and any key decisions made.` +
+            `</context-awareness>`
+          )
+        }
       }
     },
 
