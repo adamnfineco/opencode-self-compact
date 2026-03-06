@@ -21,9 +21,9 @@
  *
  * Config (optional, ~/.config/opencode/self-compact.json):
  *   {
- *     "buffer": 8000,       // tokens before overflow to trigger checkpoint (default: 8000)
- *     "showUsage": true,    // always show usage line in system prompt (default: true)
- *     "enabled": true       // disable entirely (default: true)
+ *     "usableLimitBuffer": 8000,  // tokens before the usable limit to trigger checkpoint (default: 8000)
+ *     "showUsage": true,          // always show usage line in system prompt (default: true)
+ *     "enabled": true             // disable entirely (default: true)
  *   }
  */
 
@@ -38,16 +38,16 @@ import type { Event, Model } from "@opencode-ai/sdk"
 
 interface SelfCompactConfig {
   /**
-   * Token buffer before overflow at which to trigger the checkpoint (default: 8000).
-   * When estimated tokens reach (usableLimit - buffer), the plugin tells the agent
-   * to call compact_checkpoint. Same unit as OpenCode's compaction.reserved.
+   * Token buffer before the usable limit at which to trigger the checkpoint (default: 8000).
+   * When estimated tokens reach (usableLimit - usableLimitBuffer), the plugin tells
+   * the agent to call compact_checkpoint. Same unit as OpenCode's compaction.reserved.
    *
    * This needs to be large enough for:
    *   - The model's checkpoint response (~1-2k tokens)
    *   - A safety margin for heuristic token counting error (~2-3k)
    *   - Room for the current turn's output to land (~2-3k)
    */
-  buffer: number
+  usableLimitBuffer: number
   /** Always show the usage line in the system prompt (default: true) */
   showUsage: boolean
   /** Disable the plugin entirely (default: true = enabled) */
@@ -76,7 +76,7 @@ const INTERNAL_AGENT_SIGNATURES = [
 // ─── Config loading ───────────────────────────────────────────────────────────
 
 const DEFAULT_CONFIG: SelfCompactConfig = {
-  buffer: 8000,
+  usableLimitBuffer: 8000,
   showUsage: true,
   enabled: true,
 }
@@ -311,7 +311,7 @@ export const SelfCompact: Plugin = async ({ client }) => {
       }
 
       // Check if we've crossed the threshold
-      const thresholdTokens = usableLimit - userConfig.buffer
+      const thresholdTokens = usableLimit - userConfig.usableLimitBuffer
       const overThreshold = currentTokens >= thresholdTokens && !compactTriggered
 
       if (overThreshold) {
