@@ -25,7 +25,7 @@
  * Config (optional, ~/.config/opencode/self-compact.json):
  *   {
  *     "threshold": 75,          // % of usable limit to trigger the soft nudge (default: 75)
- *     "hardStopThreshold": 88,  // % at which to issue a hard-stop directive (default: 88)
+ *     "hardStopThreshold": 98,  // % at which to hard-stop — just under OpenCode's overflow (default: 98)
  *     "showUsage": true,        // always show usage line in system prompt (default: true)
  *     "enabled": true           // disable entirely (default: true)
  *   }
@@ -43,7 +43,13 @@ import type { Event, Model } from "@opencode-ai/sdk"
 interface SelfCompactConfig {
   /** % of usable limit at which to nudge the agent (default: 75) */
   threshold: number
-  /** % at which to issue a hard-stop directive — call compact_checkpoint NOW (default: 88) */
+  /**
+   * % at which to issue a hard-stop directive (default: 98).
+   * Intentionally close to 100% — this is "just under OpenCode's overflow trigger".
+   * OpenCode auto-compacts when count >= usable (i.e. ~100%). We fire at 98%
+   * so the agent gets one last chance to checkpoint before overflow takes over.
+   * Override lower if your sessions have large responses that cross 2% in one turn.
+   */
   hardStopThreshold: number
   /** Always show the usage line in the system prompt (default: true) */
   showUsage: boolean
@@ -74,7 +80,7 @@ const INTERNAL_AGENT_SIGNATURES = [
 
 const DEFAULT_CONFIG: SelfCompactConfig = {
   threshold: 75,
-  hardStopThreshold: 88,
+  hardStopThreshold: 98,
   showUsage: true,
   enabled: true,
 }
@@ -119,15 +125,24 @@ export const SelfCompact: Plugin = async ({ client }) => {
   let lastMessageChars = 0
 
   // ─── Compute usable limit from model info ──────────────────────────────────
-  // Mirrors OpenCode's isOverflow logic:
-  //   usable = limit.context - max(reserved, maxOutputTokens)
-  // This ensures our threshold tracks OpenCode's actual compaction boundary,
-  // even if the user changes compaction.reserved in their config.
+  // Mirrors OpenCode's isOverflow logic exactly:
+  //   reserved = config.compaction.reserved ?? min(20_000, maxOutputTokens)
+  //   usable   = model.limit.input ? limit.input - reserved
+  //                                : limit.context - maxOutputTokens
+  // model.limit.input is the provider-reported input-only limit (some models
+  // have separate input/output windows). Falls back to context - maxOutput.
+
+  const OUTPUT_TOKEN_MAX = 32_000  // matches OpenCode's ProviderTransform
 
   function computeUsableLimit(model: Model): number {
-    const maxOutputTokens = Math.min(model.limit.output ?? 32_000, 32_000)
-    const reserved = Math.max(compactionReserved, maxOutputTokens)
-    return model.limit.context - reserved
+    const maxOutputTokens = Math.min(model.limit.output ?? OUTPUT_TOKEN_MAX, OUTPUT_TOKEN_MAX) || OUTPUT_TOKEN_MAX
+    const reserved = compactionReserved !== 20_000
+      ? compactionReserved  // user explicitly set it
+      : Math.min(20_000, maxOutputTokens)
+    const inputLimit = (model as any).limit?.input
+    return inputLimit
+      ? inputLimit - reserved
+      : model.limit.context - maxOutputTokens
   }
 
   // ─── Hooks ────────────────────────────────────────────────────────────────
