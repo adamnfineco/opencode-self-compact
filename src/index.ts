@@ -25,7 +25,7 @@
  * Config (optional, ~/.config/opencode/self-compact.json):
  *   {
  *     "threshold": 75,          // % of usable limit to trigger the soft nudge (default: 75)
- *     "hardStopThreshold": 98,  // % at which to hard-stop — just under OpenCode's overflow (default: 98)
+ *     "hardStopBuffer": 2000,   // tokens before overflow to hard-stop (default: 2000)
  *     "showUsage": true,        // always show usage line in system prompt (default: true)
  *     "enabled": true           // disable entirely (default: true)
  *   }
@@ -44,13 +44,13 @@ interface SelfCompactConfig {
   /** % of usable limit at which to nudge the agent (default: 75) */
   threshold: number
   /**
-   * % at which to issue a hard-stop directive (default: 98).
-   * Intentionally close to 100% — this is "just under OpenCode's overflow trigger".
-   * OpenCode auto-compacts when count >= usable (i.e. ~100%). We fire at 98%
-   * so the agent gets one last chance to checkpoint before overflow takes over.
-   * Override lower if your sessions have large responses that cross 2% in one turn.
+   * Token buffer before overflow at which to issue a hard-stop directive (default: 2000).
+   * The hard-stop fires when estimated tokens reach (usableLimit - hardStopBuffer).
+   * Same unit as OpenCode's compaction.reserved — tokens, not percentage.
+   * Default of 2000 gives the agent roughly one medium response of headroom.
+   * Increase if your sessions produce large outputs per turn.
    */
-  hardStopThreshold: number
+  hardStopBuffer: number
   /** Always show the usage line in the system prompt (default: true) */
   showUsage: boolean
   /** Disable the plugin entirely (default: true = enabled) */
@@ -80,7 +80,7 @@ const INTERNAL_AGENT_SIGNATURES = [
 
 const DEFAULT_CONFIG: SelfCompactConfig = {
   threshold: 75,
-  hardStopThreshold: 98,
+  hardStopBuffer: 2000,
   showUsage: true,
   enabled: true,
 }
@@ -258,15 +258,20 @@ export const SelfCompact: Plugin = async ({ client }) => {
         )
       }
 
-      // Threshold nudge — two levels
-      if (!compactTriggered && currentPercent >= userConfig.threshold) {
-        const hardStop = currentPercent >= (userConfig.hardStopThreshold ?? 88)
+      // Threshold nudge — two levels:
+      //   soft = percentage-based (default 75%)
+      //   hard = token-based buffer before overflow (default 2000 tokens from the wall)
+      const hardStopAt = usableLimit - (userConfig.hardStopBuffer ?? 2000)
+      const isHardStop = currentTokens >= hardStopAt
+      const isSoftNudge = currentPercent >= userConfig.threshold
 
-        if (hardStop) {
+      if (!compactTriggered && (isHardStop || isSoftNudge)) {
+        if (isHardStop) {
+          const remaining = usableLimit - currentTokens
           // Hard stop — agent is dangerously close to overflow. Be unambiguous.
           output.system.push(
             `<context-awareness level="critical">` +
-            `CRITICAL: Context is at ${currentPercent}% (${currentTokens.toLocaleString()} / ${usableLimit.toLocaleString()} usable tokens). ` +
+            `CRITICAL: Context is ${remaining.toLocaleString()} tokens from overflow (${currentTokens.toLocaleString()} / ${usableLimit.toLocaleString()} usable). ` +
             `You MUST call compact_checkpoint RIGHT NOW as your very next action — do NOT finish any current step first, do NOT make any other tool calls. ` +
             `If you do not call it immediately, compaction will fire without your state and you will lose context. ` +
             `Include: goal, accomplished, in_progress, next_steps, key_decisions, relevant_files.` +
